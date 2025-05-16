@@ -1,6 +1,10 @@
 // Copyright 2023 Simo Sorce
 // See LICENSE.txt file for terms
 
+//! This module handles RSA key object factories, ASN.1 structures for key
+//! export/import, and registration of RSA-related PKCS#11 mechanisms (PKCS#1
+//! v1.5, PSS, OAEP).
+
 use std::fmt::Debug;
 
 use crate::attribute::Attribute;
@@ -14,6 +18,34 @@ use crate::ossl::rsa::*;
 use asn1;
 use once_cell::sync::Lazy;
 
+/// Macro to check that an attribute that contains a vector of bytes
+/// exists and contains a vector of length greater than 0
+#[allow(unused_macros)]
+macro_rules! bytes_attr_not_empty {
+    ($obj:expr; $id:expr) => {
+        match $obj.get_attr_as_bytes($id) {
+            Ok(e) => {
+                if e.len() == 0 {
+                    return Err(CKR_ATTRIBUTE_VALUE_INVALID)?;
+                }
+            }
+            Err(e) => {
+                if e.attr_not_found() {
+                    return Err(CKR_TEMPLATE_INCOMPLETE)?;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    };
+}
+
+/// Performs common validation checks for RSA key attributes during object creation.
+///
+/// Checks for:
+/// - Presence and consistency of CKA_MODULUS and CKA_MODULUS_BITS.
+/// - Minimum modulus size.
+/// - Presence of required attributes based on CKA_CLASS (Public/Private).
 fn rsa_check_import(obj: &Object) -> Result<()> {
     let modulus = match obj.get_attr_as_bytes(CKA_MODULUS) {
         Ok(m) => m,
@@ -53,12 +85,17 @@ fn rsa_check_import(obj: &Object) -> Result<()> {
     Ok(())
 }
 
+/// The RSA Public-Key Factory.
 #[derive(Debug, Default)]
 pub struct RSAPubFactory {
     data: ObjectFactoryData,
 }
 
 impl RSAPubFactory {
+    /// Initializes a new RSA Public-Key factory.
+    ///
+    /// Sets up common public key attributes and RSA-specific required attributes
+    /// like CKA_MODULUS and CKA_PUBLIC_EXPONENT.
     pub fn new() -> RSAPubFactory {
         let mut factory: RSAPubFactory = Default::default();
 
@@ -83,6 +120,11 @@ impl RSAPubFactory {
 }
 
 impl ObjectFactory for RSAPubFactory {
+    /// Creates an RSA Public-Key Object from a template.
+    ///
+    /// Validates that the provided attributes are consistent with the
+    /// factory via [ObjectFactory::default_object_create] and performs
+    /// RSA-specific checks using [rsa_check_import].
     fn create(&self, template: &[CK_ATTRIBUTE]) -> Result<Object> {
         let mut obj = self.default_object_create(template)?;
 
@@ -104,8 +146,12 @@ impl CommonKeyFactory for RSAPubFactory {}
 
 impl PubKeyFactory for RSAPubFactory {}
 
+/// Represents the ASN.1 Version field (integer). Always 0 for standard RSA keys.
 type Version = u64;
 
+/// Represents the ASN.1 structure `OtherPrimeInfo` for multi-prime RSA
+///
+/// Defined in [RFC 8017](https://www.rfc-editor.org/rfc/rfc8017).
 #[derive(asn1::Asn1Read, asn1::Asn1Write)]
 struct OtherPrimeInfo<'a> {
     prime: DerEncBigUint<'a>,
@@ -113,6 +159,9 @@ struct OtherPrimeInfo<'a> {
     coefficient: DerEncBigUint<'a>,
 }
 
+/// Represents the ASN.1 structure `RSAPrivateKey`
+///
+/// Defined in [RFC 8017](https://www.rfc-editor.org/rfc/rfc8017).
 #[derive(asn1::Asn1Read, asn1::Asn1Write)]
 struct RSAPrivateKey<'a> {
     version: Version,
@@ -128,6 +177,7 @@ struct RSAPrivateKey<'a> {
 }
 
 impl RSAPrivateKey<'_> {
+    /// Constructs an `RSAPrivateKey` ASN.1 structure from byte slices of its components.
     pub fn new_owned<'a>(
         modulus: &'a Vec<u8>,
         public_exponent: &'a Vec<u8>,
@@ -153,12 +203,18 @@ impl RSAPrivateKey<'_> {
     }
 }
 
+/// The RSA Private-Key Factory.
 #[derive(Debug, Default)]
 pub struct RSAPrivFactory {
     data: ObjectFactoryData,
 }
 
 impl RSAPrivFactory {
+    /// Initializes a new RSA Private-Key factory.
+    ///
+    /// Sets up common private key attributes and all RSA private key component
+    /// attributes (CKA_MODULUS, CKA_PUBLIC_EXPONENT, CKA_PRIVATE_EXPONENT, CKA_PRIME_1, etc.).
+    /// Sets CKA_PRIVATE defaults appropriately.
     pub fn new() -> RSAPrivFactory {
         let mut factory: RSAPrivFactory = Default::default();
 
@@ -208,6 +264,11 @@ impl RSAPrivFactory {
 }
 
 impl ObjectFactory for RSAPrivFactory {
+    /// Creates an RSA Private-Key Object from a template.
+    ///
+    /// Validates that the provided attributes are consistent with the
+    /// factory via [ObjectFactory::default_object_create] and performs
+    /// RSA-specific checks using [rsa_check_import].
     fn create(&self, template: &[CK_ATTRIBUTE]) -> Result<Object> {
         let mut obj = self.default_object_create(template)?;
 
@@ -240,6 +301,12 @@ impl ObjectFactory for RSAPrivFactory {
 impl CommonKeyFactory for RSAPrivFactory {}
 
 impl PrivKeyFactory for RSAPrivFactory {
+    /// Exports the RSA private key material in PKCS#8 format for wrapping.
+    ///
+    /// Checks if the key is extractable (CKA_EXTRACTABLE=true).
+    /// Constructs an ASN.1 `RSAPrivateKey` structure from the key's attributes.
+    /// Wraps the `RSAPrivateKey` bytes inside a PKCS#8 `PrivateKeyInfo` structure.
+    /// Returns the DER-encoded `PrivateKeyInfo`.
     fn export_for_wrapping(&self, key: &Object) -> Result<Vec<u8>> {
         key.check_key_ops(CKO_PRIVATE_KEY, CKK_RSA, CKA_EXTRACTABLE)?;
 
@@ -264,6 +331,14 @@ impl PrivKeyFactory for RSAPrivFactory {
         }
     }
 
+    /// Imports an RSA private key from wrapped data (expected PKCS#8 format).
+    ///
+    /// Creates a base private key object using the template and factory defaults.
+    /// Parses the input data as a DER-encoded PKCS#8 `PrivateKeyInfo`.
+    /// Validates the AlgorithmIdentifier OID is for RSA.
+    /// Parses the inner `privateKey` OCTET STRING as an `RSAPrivateKey` structure.
+    /// Sets the attributes of the new key object based on the parsed ASN.1 components.
+    /// Returns the newly created key object.
     fn import_from_wrapped(
         &self,
         data: Vec<u8>,
@@ -358,18 +433,26 @@ impl PrivKeyFactory for RSAPrivFactory {
     }
 }
 
+/// The static RSA Public Key factory.
+///
+/// Instantiated once via `Lazy` for thread-safe initialization.
 static PUBLIC_KEY_FACTORY: Lazy<Box<dyn ObjectFactory>> =
     Lazy::new(|| Box::new(RSAPubFactory::new()));
 
+/// The static RSA Private Key factory.
+///
+/// Instantiated once via `Lazy` for thread-safe initialization.
 static PRIVATE_KEY_FACTORY: Lazy<Box<dyn ObjectFactory>> =
     Lazy::new(|| Box::new(RSAPrivFactory::new()));
 
+/// Object representing various RSA mechanisms (PKCS#1 v1.5, PSS, OAEP).
 #[derive(Debug)]
 struct RsaPKCSMechanism {
     info: CK_MECHANISM_INFO,
 }
 
 impl RsaPKCSMechanism {
+    /// Helper function to create a new `RsaPKCSMechanism` instance with specified flags.
     fn new_mechanism(flags: CK_FLAGS) -> Box<dyn Mechanism> {
         Box::new(RsaPKCSMechanism {
             info: CK_MECHANISM_INFO {
@@ -380,6 +463,10 @@ impl RsaPKCSMechanism {
         })
     }
 
+    /// Registers all supported RSA mechanisms with the mechanism manager.
+    ///
+    /// This includes CKM_RSA_PKCS, CKM_RSA_X_509, various PKCS#1 v1.5 and PSS signature schemes,
+    /// key generation (CKM_RSA_PKCS_KEY_PAIR_GEN), and OAEP (CKM_RSA_PKCS_OAEP).
     pub fn register_mechanisms(mechs: &mut Mechanisms) {
         for ckm in &[CKM_RSA_X_509, CKM_RSA_PKCS] {
             mechs.add_mechanism(
@@ -440,6 +527,10 @@ impl Mechanism for RsaPKCSMechanism {
         &self.info
     }
 
+    /// Initializes an RSA encryption operation.
+    ///
+    /// Checks mechanism flags and key suitability, then delegates to
+    /// [RsaPKCSOperation::encrypt_new].
     fn encryption_new(
         &self,
         mech: &CK_MECHANISM,
@@ -457,6 +548,10 @@ impl Mechanism for RsaPKCSMechanism {
         )?))
     }
 
+    /// Initializes an RSA decryption operation.
+    ///
+    /// Checks mechanism flags and key suitability, then delegates to
+    /// [RsaPKCSOperation::decrypt_new].
     fn decryption_new(
         &self,
         mech: &CK_MECHANISM,
@@ -473,6 +568,11 @@ impl Mechanism for RsaPKCSMechanism {
             mech, key, &self.info,
         )?))
     }
+
+    /// Initializes an RSA signing operation.
+    ///
+    /// Checks mechanism flags and key suitability, then delegates to
+    /// [RsaPKCSOperation::sign_new].
     fn sign_new(
         &self,
         mech: &CK_MECHANISM,
@@ -487,6 +587,11 @@ impl Mechanism for RsaPKCSMechanism {
         }
         Ok(Box::new(RsaPKCSOperation::sign_new(mech, key, &self.info)?))
     }
+
+    /// Initializes an RSA verification operation.
+    ///
+    /// Checks mechanism flags and key suitability, then delegates to
+    /// [RsaPKCSOperation::verify_new].
     fn verify_new(
         &self,
         mech: &CK_MECHANISM,
@@ -504,6 +609,41 @@ impl Mechanism for RsaPKCSMechanism {
         )?))
     }
 
+    /// Initializes an RSA verification operation front-loading the
+    /// signature to verify.
+    ///
+    /// Checks mechanism flags and key suitability, then delegates to
+    /// [RsaPKCSOperation::verify_signature_new].
+    #[cfg(feature = "pkcs11_3_2")]
+    fn verify_signature_new(
+        &self,
+        mech: &CK_MECHANISM,
+        key: &Object,
+        signature: &[u8],
+    ) -> Result<Box<dyn VerifySignature>> {
+        if self.info.flags & CKF_VERIFY != CKF_VERIFY {
+            return Err(CKR_MECHANISM_INVALID)?;
+        }
+        match key.check_key_ops(CKO_PUBLIC_KEY, CKK_RSA, CKA_VERIFY) {
+            Ok(_) => (),
+            Err(e) => return Err(e),
+        }
+        Ok(Box::new(RsaPKCSOperation::verify_signature_new(
+            mech, key, &self.info, signature,
+        )?))
+    }
+
+    /// Generates an RSA key pair.
+    ///
+    /// Creates preliminary public and private key objects based on templates
+    /// and factory defaults.
+    ///
+    /// Extracts modulus bits and public exponent (defaulting to 65537 if not
+    /// provided) from the public key template.
+    ///
+    /// Delegates actual key generation to [RsaPKCSOperation::generate_keypair].
+    ///
+    /// Sets default attributes (like CKA_LOCAL) on the generated keys.
     fn generate_keypair(
         &self,
         mech: &CK_MECHANISM,
@@ -563,6 +703,14 @@ impl Mechanism for RsaPKCSMechanism {
         Ok((pubkey, privkey))
     }
 
+    /// Wraps a key using RSA.
+    ///
+    /// Checks mechanism flags and key suitability.
+    ///
+    /// Exports the key-to-be-wrapped using its factory's
+    /// `export_for_wrapping`.
+    ///
+    /// Delegates the actual wrapping operation to [RsaPKCSOperation::wrap].
     fn wrap_key(
         &self,
         mech: &CK_MECHANISM,
@@ -584,6 +732,15 @@ impl Mechanism for RsaPKCSMechanism {
         )
     }
 
+    /// Unwraps a key using RSA.
+    ///
+    /// Checks mechanism flags and key suitability.
+    ///
+    /// Delegates the actual unwrapping operation to
+    /// [RsaPKCSOperation::unwrap] to get the raw key bytes.
+    ///
+    /// Imports the raw key bytes into a new key object using the target
+    /// factory's `import_from_wrapped`.
     fn unwrap_key(
         &self,
         mech: &CK_MECHANISM,
@@ -601,6 +758,7 @@ impl Mechanism for RsaPKCSMechanism {
     }
 }
 
+/// Registers all RSA mechanisms and key factories
 pub fn register(mechs: &mut Mechanisms, ot: &mut ObjectFactories) {
     RsaPKCSMechanism::register_mechanisms(mechs);
 

@@ -1,15 +1,6 @@
 // Copyright 2024 Simo Sorce
 // See LICENSE.txt file for terms
 
-#[cfg(all(feature = "dynamic", feature = "fips"))]
-compile_error!("Feature 'dynamic' and 'fips' are mutually exclusive and cannot be enabled together");
-
-#[cfg(all(
-    feature = "ecdh",
-    not(any(feature = "ecdsa", feature = "ec_montgomery"))
-))]
-compile_error!("Feature 'ecdh' requires either 'ecdsa' or 'ec_montgomery'");
-
 #[cfg(feature = "aes")]
 mod aes;
 
@@ -43,9 +34,14 @@ mod tlskdf;
 #[cfg(feature = "mlkem")]
 mod mlkem;
 
+#[cfg(feature = "mldsa")]
+mod mldsa;
+
 use mechanism::Mechanisms;
 use object::ObjectFactories;
 
+/// Registers all mechanisms and object factories that have been enabled
+/// at compile time. Called by [Token::new]
 fn register_all(mechs: &mut Mechanisms, ot: &mut ObjectFactories) {
     object::register(mechs, ot);
 
@@ -90,6 +86,9 @@ fn register_all(mechs: &mut Mechanisms, ot: &mut ObjectFactories) {
 
     #[cfg(feature = "mlkem")]
     mlkem::register(mechs, ot);
+
+    #[cfg(feature = "mldsa")]
+    mldsa::register(mechs, ot);
 
     #[cfg(feature = "fips")]
     fips::register(mechs, ot);

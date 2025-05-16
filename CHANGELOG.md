@@ -6,6 +6,21 @@ All notable changes to this project should be documented in this file.
 
 ### What Changed
 
+* Added support for ML-DSA signature scheme
+
+* Added support for SignatureVerify APIs with all algorithms
+  [Support SignatureVerify APIs with all algorithms](https://github.com/latchset/kryoptic/pull/216)
+
+* Fixed a database format bug that would affect cross-platform portability
+  [Add better support for array of attributes](https://github.com/latchset/kryoptic/pull/219)
+
+* Added doc string with Gemini's help to most files
+  [Add more documentation strings and cleanup changes](https://github.com/latchset/kryoptic/pull/229)
+
+* Made Token Info more spec compliant and added relevant information like the
+  software releae version.
+  [Make token info a little more useful](https://github.com/latchset/kryoptic/pull/237)
+
 # [1.1.0]
 ## 2025-04-14
 

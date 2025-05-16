@@ -1,6 +1,10 @@
 // Copyright 2023 - 2024 Simo Sorce, Jakub Jelen
 // See LICENSE.txt file for terms
 
+//! This module implements ECDSA (Elliptic Curve Digital Signature Algorithm)
+//! functionalities using the OpenSSL EVP interface, including key generation,
+//! signing, verification, and signature format conversions.
+
 use core::ffi::c_char;
 
 use crate::attribute::Attribute;
@@ -21,6 +25,11 @@ use crate::ossl::fips::*;
 #[cfg(not(feature = "fips"))]
 use crate::ossl::get_libctx;
 
+/// Converts a PKCS#11 EC key `Object` into OpenSSL parameters (`OsslParam`).
+///
+/// Extracts the curve name and relevant key components (public point or private
+/// value) based on the object `class` and populates an `OsslParam` structure
+/// suitable for creating an OpenSSL `EvpPkey`.
 pub fn ecc_object_to_params(
     key: &Object,
     class: CK_OBJECT_CLASS,
@@ -58,12 +67,16 @@ pub fn ecc_object_to_params(
     Ok((name_as_char(EC_NAME), params))
 }
 
+/// ASN.1 structure for an ECDSA signature value (SEQUENCE of two INTEGERs).
 #[derive(asn1::Asn1Read, asn1::Asn1Write)]
 struct EcdsaSignature<'a> {
     r: DerEncBigUint<'a>,
     s: DerEncBigUint<'a>,
 }
 
+/// Copies one half (r or s) of an ECDSA signature from an input slice `hin`
+/// to an output slice `hout` of potentially different (but sufficient) length,
+/// handling necessary padding or truncation of leading zeros.
 fn slice_to_sig_half(hin: &[u8], hout: &mut [u8]) -> Result<()> {
     let mut len = hin.len();
     if len > hout.len() {
@@ -126,29 +139,43 @@ fn pkcs11_to_ossl_signature(signature: &[u8]) -> Result<Vec<u8>> {
     Ok(ossl_sign)
 }
 
+/// Represents an active ECDSA signing or verification operation.
 #[derive(Debug)]
-pub struct EccOperation {
+pub struct EcdsaOperation {
+    /// The specific ECDSA mechanism type (e.g., CKM_ECDSA_SHA256).
     mech: CK_MECHANISM_TYPE,
+    /// Expected output length of the signature in bytes (2 * field size).
     output_len: usize,
+    /// The public key used for verification (wrapped `EvpPkey`).
     public_key: Option<EvpPkey>,
+    /// The private key used for signing (wrapped `EvpPkey`).
     private_key: Option<EvpPkey>,
+    /// Flag indicating if the operation has been finalized.
     finalized: bool,
+    /// Flag indicating if the operation is in progress.
     in_use: bool,
+    /// The underlying EVP MD CTX (non fips builds)
     #[cfg(not(feature = "fips"))]
     sigctx: Option<EvpMdCtx>,
+    /// The underlying wrapped `EVP_SIGNATURE` context (fips builds)
     #[cfg(feature = "fips")]
     sigctx: Option<ProviderSignatureCtx>,
+    /// Optional storage for signatures, used when the signature to verify
+    /// is provided at initialization
+    signature: Option<Vec<u8>>,
 }
 
-impl EccOperation {
+impl EcdsaOperation {
+    /// Helper function to create a new boxed `EcdsaMechanism`.
     fn new_mechanism() -> Box<dyn Mechanism> {
-        Box::new(EccMechanism::new(
+        Box::new(EcdsaMechanism::new(
             CK_ULONG::try_from(MIN_EC_SIZE_BITS).unwrap(),
             CK_ULONG::try_from(MAX_EC_SIZE_BITS).unwrap(),
             CKF_SIGN | CKF_VERIFY,
         ))
     }
 
+    /// Registers all supported ECDSA mechanisms with the `Mechanisms` registry.
     pub fn register_mechanisms(mechs: &mut Mechanisms) {
         for ckm in &[
             CKM_ECDSA,
@@ -167,7 +194,7 @@ impl EccOperation {
 
         mechs.add_mechanism(
             CKM_EC_KEY_PAIR_GEN,
-            Box::new(EccMechanism::new(
+            Box::new(EcdsaMechanism::new(
                 CK_ULONG::try_from(MIN_EC_SIZE_BITS).unwrap(),
                 CK_ULONG::try_from(MAX_EC_SIZE_BITS).unwrap(),
                 CKF_GENERATE_KEY_PAIR,
@@ -175,54 +202,94 @@ impl EccOperation {
         );
     }
 
+    /// Internal constructor to create a new `EcdsaOperation`.
+    ///
+    /// Sets up the internal state based on whether it's a signature or
+    /// verification operation, imports the provided key, and calculates
+    /// the expected signature length.
+    fn new_op(
+        flag: CK_FLAGS,
+        mech: &CK_MECHANISM,
+        key: &Object,
+        signature: Option<Vec<u8>>,
+    ) -> Result<EcdsaOperation> {
+        let public_key: Option<EvpPkey>;
+        let private_key: Option<EvpPkey>;
+        let output_len: usize;
+        match flag {
+            CKF_SIGN => {
+                public_key = None;
+                let privkey = EvpPkey::privkey_from_object(key)?;
+                output_len = 2 * ((privkey.get_bits()? + 7) / 8);
+                private_key = Some(privkey);
+            }
+            CKF_VERIFY => {
+                private_key = None;
+                let pubkey = EvpPkey::pubkey_from_object(key)?;
+                output_len = 2 * ((pubkey.get_bits()? + 7) / 8);
+                if let Some(s) = &signature {
+                    if s.len() != output_len {
+                        return Err(CKR_SIGNATURE_LEN_RANGE)?;
+                    }
+                }
+                public_key = Some(pubkey);
+            }
+            _ => return Err(CKR_GENERAL_ERROR)?,
+        }
+        Ok(EcdsaOperation {
+            mech: mech.mechanism,
+            output_len: output_len,
+            public_key: public_key,
+            private_key: private_key,
+            finalized: false,
+            in_use: false,
+            sigctx: match mech.mechanism {
+                CKM_ECDSA => None,
+                #[cfg(feature = "fips")]
+                _ => Some(ProviderSignatureCtx::new(name_as_char(ECDSA_NAME))?),
+                #[cfg(not(feature = "fips"))]
+                _ => Some(EvpMdCtx::new()?),
+            },
+            signature: signature,
+        })
+    }
+
+    /// Creates a new `EcdsaOperation` for signing.
     pub fn sign_new(
         mech: &CK_MECHANISM,
         key: &Object,
         _: &CK_MECHANISM_INFO,
-    ) -> Result<EccOperation> {
-        let privkey = EvpPkey::privkey_from_object(key)?;
-        let outlen = 2 * ((privkey.get_bits()? + 7) / 8);
-        Ok(EccOperation {
-            mech: mech.mechanism,
-            output_len: outlen,
-            public_key: None,
-            private_key: Some(privkey),
-            finalized: false,
-            in_use: false,
-            sigctx: match mech.mechanism {
-                CKM_ECDSA => None,
-                #[cfg(feature = "fips")]
-                _ => Some(ProviderSignatureCtx::new(name_as_char(ECDSA_NAME))?),
-                #[cfg(not(feature = "fips"))]
-                _ => Some(EvpMdCtx::new()?),
-            },
-        })
+    ) -> Result<EcdsaOperation> {
+        Self::new_op(CKF_SIGN, mech, key, None)
     }
 
+    /// Creates a new `EcdsaOperation` for verification.
     pub fn verify_new(
         mech: &CK_MECHANISM,
         key: &Object,
         _: &CK_MECHANISM_INFO,
-    ) -> Result<EccOperation> {
-        let pubkey = EvpPkey::pubkey_from_object(key)?;
-        let outlen = 2 * ((pubkey.get_bits()? + 7) / 8);
-        Ok(EccOperation {
-            mech: mech.mechanism,
-            output_len: outlen,
-            public_key: Some(pubkey),
-            private_key: None,
-            finalized: false,
-            in_use: false,
-            sigctx: match mech.mechanism {
-                CKM_ECDSA => None,
-                #[cfg(feature = "fips")]
-                _ => Some(ProviderSignatureCtx::new(name_as_char(ECDSA_NAME))?),
-                #[cfg(not(feature = "fips"))]
-                _ => Some(EvpMdCtx::new()?),
-            },
-        })
+    ) -> Result<EcdsaOperation> {
+        Self::new_op(CKF_VERIFY, mech, key, None)
     }
 
+    /// Creates a new `EcdsaOperation` for verification with a pre-supplied
+    /// signature.
+    #[cfg(feature = "pkcs11_3_2")]
+    pub fn verify_signature_new(
+        mech: &CK_MECHANISM,
+        key: &Object,
+        _: &CK_MECHANISM_INFO,
+        signature: &[u8],
+    ) -> Result<EcdsaOperation> {
+        Self::new_op(CKF_VERIFY, mech, key, Some(signature.to_vec()))
+    }
+
+    /// Generates an EC key pair using OpenSSL.
+    ///
+    /// Takes mutable references to pre-created public and private key
+    /// `Object`s (which contain the desired curve in CKA_EC_PARAMS),
+    /// generates the key pair, and populates the CKA_EC_POINT and CKA_VALUE
+    /// attributes.
     pub fn generate_keypair(
         pubkey: &mut Object,
         privkey: &mut Object,
@@ -255,7 +322,7 @@ impl EccOperation {
     }
 }
 
-impl MechOperation for EccOperation {
+impl MechOperation for EcdsaOperation {
     fn mechanism(&self) -> Result<CK_MECHANISM_TYPE> {
         Ok(self.mech)
     }
@@ -265,7 +332,7 @@ impl MechOperation for EccOperation {
     }
 }
 
-impl Sign for EccOperation {
+impl Sign for EcdsaOperation {
     fn sign(&mut self, data: &[u8], signature: &mut [u8]) -> Result<()> {
         if self.in_use {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
@@ -276,7 +343,7 @@ impl Sign for EccOperation {
         if self.mech == CKM_ECDSA {
             self.finalized = true;
             if signature.len() != self.output_len {
-                return Err(CKR_GENERAL_ERROR)?;
+                return Err(CKR_SIGNATURE_LEN_RANGE)?;
             }
             let mut ctx = some_or_err!(mut self.private_key).new_ctx()?;
             let res = unsafe { EVP_PKEY_sign_init(ctx.as_mut_ptr()) };
@@ -427,8 +494,13 @@ impl Sign for EccOperation {
     }
 }
 
-impl Verify for EccOperation {
-    fn verify(&mut self, data: &[u8], signature: &[u8]) -> Result<()> {
+impl EcdsaOperation {
+    /// Internal helper for performing one-shot or final verification step.
+    fn verify_internal(
+        &mut self,
+        data: &[u8],
+        signature: Option<&[u8]>,
+    ) -> Result<()> {
         if self.in_use {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
         }
@@ -436,9 +508,6 @@ impl Verify for EccOperation {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
         }
         if self.mech == CKM_ECDSA {
-            if signature.len() != self.output_len {
-                return Err(CKR_GENERAL_ERROR)?; // already checked in fn_verify
-            }
             let mut ctx = some_or_err!(mut self.public_key).new_ctx()?;
             let res = unsafe { EVP_PKEY_verify_init(ctx.as_mut_ptr()) };
             if res != 1 {
@@ -446,7 +515,18 @@ impl Verify for EccOperation {
             }
 
             // convert PKCS #11 signature to OpenSSL format
-            let mut ossl_sign = pkcs11_to_ossl_signature(signature)?;
+            let mut ossl_sign = match signature {
+                Some(s) => {
+                    if s.len() != self.output_len {
+                        return Err(CKR_SIGNATURE_LEN_RANGE)?;
+                    }
+                    pkcs11_to_ossl_signature(s)?
+                }
+                None => match &self.signature {
+                    Some(s) => pkcs11_to_ossl_signature(s.as_slice())?,
+                    None => return Err(CKR_GENERAL_ERROR)?,
+                },
+            };
 
             self.finalized = true;
 
@@ -465,11 +545,12 @@ impl Verify for EccOperation {
             zeromem(ossl_sign.as_mut_slice());
             return Ok(());
         }
-        self.verify_update(data)?;
-        self.verify_final(signature)
+        self.verify_int_update(data)?;
+        self.verify_int_final(signature)
     }
 
-    fn verify_update(&mut self, data: &[u8]) -> Result<()> {
+    /// Internal helper for updating a multi-part verification.
+    fn verify_int_update(&mut self, data: &[u8]) -> Result<()> {
         if self.finalized {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
         }
@@ -521,7 +602,8 @@ impl Verify for EccOperation {
         self.sigctx.as_mut().unwrap().digest_verify_update(data)
     }
 
-    fn verify_final(&mut self, signature: &[u8]) -> Result<()> {
+    /// Internal helper for the final step of multi-part verification.
+    fn verify_int_final(&mut self, signature: Option<&[u8]>) -> Result<()> {
         if !self.in_use {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
         }
@@ -530,7 +612,18 @@ impl Verify for EccOperation {
         }
 
         // convert PKCS #11 signature to OpenSSL format
-        let mut ossl_sign = pkcs11_to_ossl_signature(signature)?;
+        let mut ossl_sign = match signature {
+            Some(s) => {
+                if s.len() != self.output_len {
+                    return Err(CKR_SIGNATURE_LEN_RANGE)?;
+                }
+                pkcs11_to_ossl_signature(s)?
+            }
+            None => match &self.signature {
+                Some(s) => pkcs11_to_ossl_signature(s.as_slice())?,
+                None => return Err(CKR_GENERAL_ERROR)?,
+            },
+        };
 
         self.finalized = true;
 
@@ -555,8 +648,37 @@ impl Verify for EccOperation {
         zeromem(ossl_sign.as_mut_slice());
         Ok(())
     }
+}
+
+impl Verify for EcdsaOperation {
+    fn verify(&mut self, data: &[u8], signature: &[u8]) -> Result<()> {
+        self.verify_internal(data, Some(signature))
+    }
+
+    fn verify_update(&mut self, data: &[u8]) -> Result<()> {
+        self.verify_int_update(data)
+    }
+
+    fn verify_final(&mut self, signature: &[u8]) -> Result<()> {
+        self.verify_int_final(Some(signature))
+    }
 
     fn signature_len(&self) -> Result<usize> {
         Ok(self.output_len)
+    }
+}
+
+#[cfg(feature = "pkcs11_3_2")]
+impl VerifySignature for EcdsaOperation {
+    fn verify(&mut self, data: &[u8]) -> Result<()> {
+        self.verify_internal(data, None)
+    }
+
+    fn verify_update(&mut self, data: &[u8]) -> Result<()> {
+        self.verify_int_update(data)
+    }
+
+    fn verify_final(&mut self) -> Result<()> {
+        self.verify_int_final(None)
     }
 }

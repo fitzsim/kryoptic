@@ -236,15 +236,26 @@ fn test_mlkem_operations() {
         ],
         &[],
         &[(CKA_ENCAPSULATE, true)],
-        &[
-            (CKA_CLASS, CKO_PRIVATE_KEY),
-            (CKA_KEY_TYPE, CKK_ML_KEM),
-            (CKA_PARAMETER_SET, CKP_ML_KEM_512)
-        ],
+        &[(CKA_CLASS, CKO_PRIVATE_KEY), (CKA_KEY_TYPE, CKK_ML_KEM),],
         &[],
         &[(CKA_DECAPSULATE, true),],
     ));
 
+    // size query
+    let ret = fn_encapsulate_key(
+        session,
+        &mut mechanism,
+        pub_handle,
+        key_template.as_ptr() as *mut _,
+        key_template.len() as CK_ULONG,
+        std::ptr::null_mut(),
+        &mut outlen,
+        &mut handle_enc,
+    );
+    assert_eq!(ret, CKR_OK);
+    assert_eq!(outlen, 768);
+
+    // the operation
     let ret = fn_encapsulate_key(
         session,
         &mut mechanism,

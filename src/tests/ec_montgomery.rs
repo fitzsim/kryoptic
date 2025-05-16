@@ -385,3 +385,156 @@ fn test_ec_montgomery_derive(t: TestUnit) {
 
     testtokn.finalize();
 }
+
+#[test]
+#[parallel]
+fn test_ec_motgomery_key() {
+    let mut testtokn = TestToken::initialized("test_ecmontgomery_key", None);
+    let session = testtokn.get_session(true);
+
+    /* login */
+    testtokn.login();
+
+    let mut value = vec![0u8; 32];
+    let mut extract_template = make_ptrs_template(&[(
+        CKA_EC_POINT,
+        void_ptr!(value.as_mut_ptr()),
+        value.len(),
+    )]);
+
+    /* EC key pair */
+    let ec_params = hex::decode(
+        "130a63757276653235353139", // x25519
+    )
+    .expect("Failed to decode hex ec_params");
+
+    let (pubkey1, prikey1) = ret_or_panic!(generate_key_pair(
+        session,
+        CKM_EC_MONTGOMERY_KEY_PAIR_GEN,
+        &[
+            (CKA_CLASS, CKO_PUBLIC_KEY),
+            (CKA_KEY_TYPE, CKK_EC_MONTGOMERY),
+        ],
+        &[(CKA_EC_PARAMS, ec_params.as_slice())],
+        &[(CKA_DERIVE, true)],
+        &[
+            (CKA_CLASS, CKO_PRIVATE_KEY),
+            (CKA_KEY_TYPE, CKK_EC_MONTGOMERY),
+        ],
+        &[],
+        &[(CKA_DERIVE, true)],
+    ));
+
+    let ret = fn_get_attribute_value(
+        session,
+        pubkey1,
+        extract_template.as_mut_ptr(),
+        extract_template.len() as CK_ULONG,
+    );
+    assert_eq!(ret, CKR_OK);
+    let pubpoint1 = value.clone();
+
+    let (pubkey2, prikey2) = ret_or_panic!(generate_key_pair(
+        session,
+        CKM_EC_MONTGOMERY_KEY_PAIR_GEN,
+        &[
+            (CKA_CLASS, CKO_PUBLIC_KEY),
+            (CKA_KEY_TYPE, CKK_EC_MONTGOMERY),
+        ],
+        &[(CKA_EC_PARAMS, ec_params.as_slice())],
+        &[(CKA_DERIVE, true)],
+        &[
+            (CKA_CLASS, CKO_PRIVATE_KEY),
+            (CKA_KEY_TYPE, CKK_EC_MONTGOMERY),
+        ],
+        &[],
+        &[(CKA_DERIVE, true)],
+    ));
+
+    let ret = fn_get_attribute_value(
+        session,
+        pubkey2,
+        extract_template.as_mut_ptr(),
+        extract_template.len() as CK_ULONG,
+    );
+    assert_eq!(ret, CKR_OK);
+    let pubpoint2 = value.clone();
+
+    let mut params = CK_ECDH1_DERIVE_PARAMS {
+        kdf: CKD_NULL,
+        ulSharedDataLen: 0,
+        pSharedData: std::ptr::null_mut(),
+        ulPublicDataLen: pubpoint2.len() as CK_ULONG,
+        pPublicData: byte_ptr!(pubpoint2.as_ptr()),
+    };
+    let mut mechanism: CK_MECHANISM = CK_MECHANISM {
+        mechanism: CKM_ECDH1_DERIVE,
+        pParameter: &mut params as *mut _ as CK_VOID_PTR,
+        ulParameterLen: sizeof!(CK_ECDH1_DERIVE_PARAMS),
+    };
+
+    let derive_template = make_attr_template(
+        &[
+            (CKA_CLASS, CKO_SECRET_KEY),
+            (CKA_KEY_TYPE, CKK_AES),
+            (CKA_VALUE_LEN, 32),
+        ],
+        &[],
+        &[
+            (CKA_ENCRYPT, true),
+            (CKA_DECRYPT, true),
+            (CKA_SENSITIVE, false),
+            (CKA_EXTRACTABLE, true),
+        ],
+    );
+
+    let mut extract_template = make_ptrs_template(&[(
+        CKA_VALUE,
+        void_ptr!(value.as_mut_ptr()),
+        value.len(),
+    )]);
+
+    let mut s_handle = CK_INVALID_HANDLE;
+    let ret = fn_derive_key(
+        session,
+        &mut mechanism,
+        prikey1,
+        derive_template.as_ptr() as *mut _,
+        derive_template.len() as CK_ULONG,
+        &mut s_handle,
+    );
+    assert_eq!(ret, CKR_OK);
+
+    let ret = fn_get_attribute_value(
+        session,
+        s_handle,
+        extract_template.as_mut_ptr(),
+        extract_template.len() as CK_ULONG,
+    );
+    assert_eq!(ret, CKR_OK);
+    let ref_value = value.clone();
+
+    params.pPublicData = byte_ptr!(pubpoint1.as_ptr());
+
+    let mut s_handle = CK_INVALID_HANDLE;
+    let ret = fn_derive_key(
+        session,
+        &mut mechanism,
+        prikey2,
+        derive_template.as_ptr() as *mut _,
+        derive_template.len() as CK_ULONG,
+        &mut s_handle,
+    );
+    assert_eq!(ret, CKR_OK);
+
+    let ret = fn_get_attribute_value(
+        session,
+        s_handle,
+        extract_template.as_mut_ptr(),
+        extract_template.len() as CK_ULONG,
+    );
+    assert_eq!(ret, CKR_OK);
+    assert_eq!(value, ref_value);
+
+    testtokn.finalize();
+}

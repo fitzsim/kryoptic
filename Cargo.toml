@@ -26,10 +26,20 @@ name = "softhsm_migrate"
 path = "src/tools/softhsm/migrate.rs"
 test = false
 
+[[bin]]
+name = "kryoptic_init"
+path = "src/tools/softhsm/test_init.rs"
+test = false
+
+[[bin]]
+name = "test_signature"
+path = "src/tools/softhsm/test_signature.rs"
+test = false
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
-bindgen = "0.69"
+bindgen = "0.71"
 pkg-config = "0.3"
 
 [dependencies]
@@ -39,6 +49,7 @@ bitflags = "2.4.1"
 cfg-if = "1.0.0"
 clap = { version = "4.5.26", default-features = false, features = ["cargo", "derive", "help", "std", "usage"] }
 constant_time_eq = "0.3.0"
+cryptoki = "0.6.2"
 data-encoding = "2.4.0"
 getrandom = "0.3"
 hex = "0.4.3"
@@ -80,14 +91,15 @@ nssdb = ["dep:rusqlite", "aes", "hmac", "pbkdf2"]
 
 default = ["standard", "dynamic"]
 
-ecc_all = ["ecdsa", "ec_montgomery", "eddsa", "ecdh"]
+ecc_min = ["ecdsa", "ecdh"]
+ecc_all = ["ecc_min", "ec_montgomery", "eddsa"]
 hash_all = ["hash", "hmac"]
 kdf_all = ["hkdf", "pbkdf2", "sp800_108", "sshkdf", "tlskdf"]
 
 standard = ["sqlitedb", "ecc_all", "hash_all", "kdf_all", "rsa"]
 
 ecc_fips = ["ecdsa", "ecdh"]
-fips = ["sqlitedb", "rusqlite/bundled", "aes", "ecc_fips", "hash_all", "kdf_all", "rsa", "pkcs11_3_2"]
+fips = ["sqlitedb", "rusqlite/bundled", "aes", "ecc_fips", "hash_all", "kdf_all", "rsa", "pqc"]
 
 dynamic = [] # Builds against system libcrypto.so
 
@@ -96,5 +108,8 @@ pkcs11_3_2 = [ ] # Exposes PKCS#11 3.2 Interfaces and new functions
 slow = [] # Enables slow tests
 
 mlkem = ["pkcs11_3_2"]
+mldsa = ["pkcs11_3_2", "hash"]
 
-pqc = ["mlkem"]
+pqc = ["mlkem", "mldsa"]
+
+minimal = ["sqlitedb", "aes", "ecc_min", "hash_all", "rsa"]

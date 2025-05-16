@@ -1,6 +1,10 @@
 // Copyright 2024 Simo Sorce
 // See LICENSE.txt file for terms
 
+//! This module provides a storage backend implementation (`SqliteStorage`)
+//! that fulfills the `StorageRaw` trait using a single SQLite database file
+//! for persistence.
+
 use std::sync::{Arc, Mutex};
 
 use crate::attribute::{string_to_ck_date, AttrType, Attribute};
@@ -19,16 +23,19 @@ use rusqlite::{
     params, params_from_iter, Connection, Rows, Statement, Transaction,
 };
 
+/// Helper to wrap general errors from this module.
 fn bad_code<E: std::error::Error + 'static>(error: E) -> Error {
     Error::ck_rv_from_error(CKR_GENERAL_ERROR, error)
 }
 
+/// Helper to wrap storage/memory related errors from this module.
 fn bad_storage<E: std::error::Error + 'static>(error: E) -> Error {
     Error::ck_rv_from_error(CKR_DEVICE_MEMORY, error)
 }
 
 const DB_VERSION_COL: &str = "version";
 const DB_VERSION: &str = "v1";
+const TOKEN_INFO_META: &str = "TOKEN INFO";
 
 const DROP_META_TABLE: &str = "DROP TABLE meta";
 const CREATE_META_TABLE: &str =
@@ -51,19 +58,126 @@ const UPDATE_ATTR: &str = "INSERT OR REPLACE INTO objects VALUES (?, ?, ?)";
 const DELETE_OBJ: &str = "DELETE FROM objects WHERE id = ?";
 const MAX_ID: &str = "SELECT IFNULL(MAX(id), 0) FROM objects";
 
+/// Implements the `StorageRaw` trait using a single SQLite database file.
 #[derive(Debug)]
 pub struct SqliteStorage {
+    /// Path to the SQLite database file.
     filename: String,
+    /// Thread-safe connection to the SQLite database.
     conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteStorage {
+    /// Helper to add a boolean attribute to an `Object` from an SQLite
+    /// `ValueRef`.
+    fn add_bool(
+        obj: &mut Object,
+        atype: CK_ATTRIBUTE_TYPE,
+        val: ValueRef,
+    ) -> Result<()> {
+        obj.set_attr(match val.as_i64_or_null().map_err(bad_storage)? {
+            Some(b) => Attribute::from_bool(atype, b != 0),
+            None => return Err(CKR_ATTRIBUTE_VALUE_INVALID)?,
+        })
+    }
+
+    /// Helper to add a numeric (CK_ULONG) attribute to an `Object` from an
+    /// SQLite `ValueRef`.
+    fn add_num(
+        obj: &mut Object,
+        atype: CK_ATTRIBUTE_TYPE,
+        val: ValueRef,
+    ) -> Result<()> {
+        obj.set_attr(match val.as_i64_or_null().map_err(bad_storage)? {
+            Some(n) => Attribute::from_ulong(atype, Self::val_to_ulong(n)?),
+            None => return Err(CKR_ATTRIBUTE_VALUE_INVALID)?,
+        })
+    }
+
+    /// Helper to add a string attribute to an `Object` from an SQLite
+    /// `ValueRef`.
+    fn add_string(
+        obj: &mut Object,
+        atype: CK_ATTRIBUTE_TYPE,
+        val: ValueRef,
+    ) -> Result<()> {
+        obj.set_attr(match val.as_str_or_null().map_err(bad_storage)? {
+            Some(s) => Attribute::from_string(atype, s.to_string()),
+            None => return Err(CKR_ATTRIBUTE_VALUE_INVALID)?,
+        })
+    }
+
+    /// Helper to add a byte array attribute to an `Object` from an SQLite
+    /// `ValueRef`.
+    fn add_byte_array(
+        obj: &mut Object,
+        atype: CK_ATTRIBUTE_TYPE,
+        val: ValueRef,
+    ) -> Result<()> {
+        obj.set_attr(match val.as_blob_or_null().map_err(bad_storage)? {
+            Some(v) => Attribute::from_bytes(atype, v.to_vec()),
+            None => Attribute::from_bytes(atype, Vec::new()),
+        })
+    }
+
+    /// Helper to add a CK_ULONG array attribute to an `Object` from an SQLite
+    /// `ValueRef`.
+    fn add_ulong_array(
+        obj: &mut Object,
+        atype: CK_ATTRIBUTE_TYPE,
+        val: ValueRef,
+    ) -> Result<()> {
+        obj.set_attr(match val.as_blob_or_null().map_err(bad_storage)? {
+            Some(blob) => {
+                let ulen = std::mem::size_of::<u64>();
+                if blob.len() % ulen != 0 {
+                    return Err(CKR_DEVICE_MEMORY)?;
+                }
+                let vlen = blob.len() / ulen;
+                let mut v = Vec::with_capacity(vlen);
+
+                let mut idx = 0;
+                while idx < blob.len() {
+                    let chunk = &blob[idx..(idx + ulen)];
+                    idx += ulen;
+                    let u64val = u64::from_le_bytes(chunk.try_into()?);
+                    v.push(CK_ULONG::try_from(u64val)?);
+                }
+                Attribute::from_ulong_array(atype, v)
+            }
+            None => Attribute::from_ulong_array(atype, Vec::new()),
+        })
+    }
+
+    /// Helper to add a date attribute to an `Object` from an SQLite
+    /// `ValueRef`.
+    fn add_date(
+        obj: &mut Object,
+        atype: CK_ATTRIBUTE_TYPE,
+        val: ValueRef,
+    ) -> Result<()> {
+        obj.set_attr(match val.as_str_or_null().map_err(bad_storage)? {
+            Some(s) => {
+                if s.len() == 0 {
+                    /* special case for default empty value */
+                    Attribute::from_date_bytes(atype, Vec::new())
+                } else {
+                    Attribute::from_date(atype, string_to_ck_date(s)?)
+                }
+            }
+            None => return Err(CKR_ATTRIBUTE_VALUE_INVALID)?,
+        })
+    }
+
+    /// Converts multiple rows from an SQLite query result (`Rows`) into a
+    /// vector of `Object`s. Assumes rows are ordered by object ID and contain
+    /// attribute type and value columns.
     fn rows_to_objects(mut rows: Rows) -> Result<Vec<Object>> {
         let mut objid = 0;
         let mut objects = Vec::<Object>::new();
         while let Some(row) = rows.next().map_err(bad_storage)? {
             let id: i32 = row.get(0).map_err(bad_storage)?;
-            let atype: CK_ULONG = row.get(1).map_err(bad_storage)?;
+            let atype: CK_ATTRIBUTE_TYPE = row.get(1).map_err(bad_storage)?;
             let val = row.get_ref(2).map_err(bad_storage)?;
             if objid != id {
                 objid = id;
@@ -72,71 +186,23 @@ impl SqliteStorage {
             match objects.last_mut() {
                 Some(obj) => {
                     let attrtype = AttrType::attr_id_to_attrtype(atype)?;
-                    let attr = match attrtype {
-                        AttrType::BoolType => {
-                            match val.as_i64_or_null().map_err(bad_storage)? {
-                                Some(b) => Attribute::from_bool(atype, b != 0),
-                                None => {
-                                    return Err(CKR_ATTRIBUTE_VALUE_INVALID)?
-                                }
-                            }
+                    match attrtype {
+                        AttrType::BoolType => Self::add_bool(obj, atype, val)?,
+                        AttrType::NumType => Self::add_num(obj, atype, val)?,
+                        AttrType::StringType => {
+                            Self::add_string(obj, atype, val)?
                         }
-                        AttrType::NumType => {
-                            match val.as_i64_or_null().map_err(bad_storage)? {
-                                Some(n) => {
-                                    let val = Self::val_to_ulong(n)?;
-                                    Attribute::from_ulong(atype, val)
-                                }
-                                None => {
-                                    return Err(CKR_ATTRIBUTE_VALUE_INVALID)?
-                                }
-                            }
-                        }
-                        AttrType::StringType => match val
-                            .as_str_or_null()
-                            .map_err(bad_storage)?
-                        {
-                            Some(s) => {
-                                Attribute::from_string(atype, s.to_string())
-                            }
-                            None => return Err(CKR_ATTRIBUTE_VALUE_INVALID)?,
-                        },
                         AttrType::BytesType => {
-                            match val.as_blob_or_null().map_err(bad_storage)? {
-                                Some(v) => {
-                                    Attribute::from_bytes(atype, v.to_vec())
-                                }
-                                None => {
-                                    Attribute::from_bytes(atype, Vec::new())
-                                }
-                            }
+                            Self::add_byte_array(obj, atype, val)?
                         }
-                        AttrType::DateType => {
-                            match val.as_str_or_null().map_err(bad_storage)? {
-                                Some(s) => {
-                                    if s.len() == 0 {
-                                        /* special case for default empty value */
-                                        Attribute::from_date_bytes(
-                                            atype,
-                                            Vec::new(),
-                                        )
-                                    } else {
-                                        Attribute::from_date(
-                                            atype,
-                                            string_to_ck_date(s)?,
-                                        )
-                                    }
-                                }
-                                None => {
-                                    return Err(CKR_ATTRIBUTE_VALUE_INVALID)?
-                                }
-                            }
+                        AttrType::UlongArrayType => {
+                            Self::add_ulong_array(obj, atype, val)?
                         }
+                        AttrType::DateType => Self::add_date(obj, atype, val)?,
                         AttrType::DenyType | AttrType::IgnoreType => {
                             return Err(CKR_ATTRIBUTE_TYPE_INVALID)?
                         }
                     };
-                    obj.set_attr(attr)?;
                 }
                 _ => {
                     return Err(CKR_GENERAL_ERROR)?;
@@ -146,6 +212,10 @@ impl SqliteStorage {
         Ok(objects)
     }
 
+    /// Stores a metadata entry (key-value pair, potentially with an associated
+    /// ID or BLOB) into the `meta` table within a transaction.
+    ///
+    /// Uses INSERT OR REPLACE.
     fn store_meta(
         tx: &mut Transaction,
         name: &str,
@@ -182,6 +252,12 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Stores all attributes of an `Object` into the `objects` table within a
+    /// transaction.
+    ///
+    /// First deletes any existing attributes for the object's UID, assigns a
+    /// new numeric ID if necessary, then inserts each attribute as a separate
+    /// row (id, attr_type, value).
     fn store_object(
         tx: &mut Transaction,
         uid: &String,
@@ -209,6 +285,16 @@ impl SqliteStorage {
                 AttrType::NumType => Self::num_to_val(a.to_ulong()?)?,
                 AttrType::StringType => Value::from(a.to_string()?),
                 AttrType::BytesType => Value::from(a.to_bytes()?.clone()),
+                AttrType::UlongArrayType => Value::from({
+                    let ulen = std::mem::size_of::<u64>();
+                    let vu = a.to_ulong_array()?;
+                    let mut v = Vec::<u8>::with_capacity(vu.len() * ulen);
+                    for elem in vu.iter() {
+                        let el64 = u64::try_from(*elem)?;
+                        v.extend_from_slice(&el64.to_le_bytes());
+                    }
+                    v
+                }),
                 AttrType::DateType => Value::from(a.to_date_string()?),
                 AttrType::DenyType | AttrType::IgnoreType => continue,
             };
@@ -219,6 +305,11 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Deletes all rows associated with an object's UID from the `objects`
+    /// table within a transaction.
+    ///
+    /// Returns the numeric ID of the deleted object, or 0 if the object was
+    /// not found.
     fn delete_object(tx: &mut Transaction, uid: &String) -> Result<i32> {
         let mut stmt = tx.prepare(SEARCH_OBJ_ID).map_err(bad_storage)?;
         let objid = match stmt
@@ -238,6 +329,13 @@ impl SqliteStorage {
         Ok(objid)
     }
 
+    /// Converts a `CK_ULONG` value to a `rusqlite::Value` (specifically
+    /// `Value::Integer`).
+    ///
+    /// Handles the special case `CK_UNAVAILABLE_INFORMATION` by storing it
+    /// as -1, as SQLite's INTEGER might not store the full `u64` range
+    /// required by CK_ULONG_MAX on some platforms, while ensuring standard
+    /// PKCS#11 values fit within `i64`.
     fn num_to_val(ulong: CK_ULONG) -> Result<Value> {
         /* CK_UNAVAILABLE_INFORMATION need to be special cased */
         /* for storage compatibility CK_ULONGs can only be stored as u32
@@ -257,6 +355,9 @@ impl SqliteStorage {
         Ok(Value::from(val))
     }
 
+    /// Converts an `i64` value retrieved from SQLite back to a `CK_ULONG`.
+    /// Handles the special case -1, mapping it back to
+    /// `CK_UNAVAILABLE_INFORMATION`.
     fn val_to_ulong(val: i64) -> Result<CK_ULONG> {
         /* we need to map back CK_UNAVAILABLE_INFORMATION's special case */
         if val == -1 {
@@ -272,6 +373,7 @@ const USER_COUNTER: &str = "USER COUNTER";
 const USER_DATA: &str = "USER DATA";
 const USER_FLAGS_DEFAULT_PIN: u32 = 1;
 
+/// Implementation of the low-level `StorageRaw` trait for `SqliteStorage`.
 impl StorageRaw for SqliteStorage {
     fn is_initialized(&self) -> Result<()> {
         let conn = self.conn.lock()?;
@@ -367,6 +469,26 @@ impl StorageRaw for SqliteStorage {
                 AttrType::NumType => Self::num_to_val(a.to_ulong()?)?,
                 AttrType::StringType => Value::from(a.to_string()?),
                 AttrType::BytesType => Value::from(a.to_buf()?),
+                AttrType::UlongArrayType => Value::from({
+                    let su = a.to_slice()?;
+                    let slen = std::mem::size_of::<CK_ULONG>();
+                    if su.len() % slen != 0 {
+                        return Err(CKR_ATTRIBUTE_VALUE_INVALID)?;
+                    }
+                    let ulen = std::mem::size_of::<u64>();
+                    let mut v =
+                        Vec::<u8>::with_capacity((su.len() / slen) * ulen);
+
+                    let mut idx = 0;
+                    while idx < su.len() {
+                        let elem = &su[idx..(idx + slen)];
+                        idx += slen;
+                        let sval = CK_ULONG::from_ne_bytes(elem.try_into()?);
+                        let u64val = u64::try_from(sval)?;
+                        v.extend_from_slice(&u64val.to_le_bytes());
+                    }
+                    v
+                }),
                 AttrType::DateType => {
                     Value::from(a.to_attribute()?.to_date_string()?)
                 }
@@ -410,9 +532,10 @@ impl StorageRaw for SqliteStorage {
     fn fetch_token_info(&self) -> Result<StorageTokenInfo> {
         let mut info = StorageTokenInfo::default();
         let conn = self.conn.lock()?;
-        let mut stmt = conn
-            .prepare("SELECT value, data from meta WHERE name='TOKEN INFO'")?;
-        let mut rows = stmt.query(params![])?;
+        let mut stmt =
+            conn.prepare("SELECT value, data from meta WHERE name=?")?;
+        let mut rows =
+            stmt.query(params![Value::from(ValueRef::from(TOKEN_INFO_META))])?;
         while let Some(row) = rows.next()? {
             let name: String = row.get(0)?;
             let value: Vec<u8> = row.get(1)?;
@@ -443,28 +566,28 @@ impl StorageRaw for SqliteStorage {
 
         Self::store_meta(
             &mut tx,
-            "TOKEN INFO",
+            TOKEN_INFO_META,
             None,
             Some("label"),
             Some(&info.label as &[u8]),
         )?;
         Self::store_meta(
             &mut tx,
-            "TOKEN INFO",
+            TOKEN_INFO_META,
             None,
             Some("manufacturer"),
             Some(&info.manufacturer as &[u8]),
         )?;
         Self::store_meta(
             &mut tx,
-            "TOKEN INFO",
+            TOKEN_INFO_META,
             None,
             Some("model"),
             Some(&info.model as &[u8]),
         )?;
         Self::store_meta(
             &mut tx,
-            "TOKEN INFO",
+            TOKEN_INFO_META,
             None,
             Some("serial"),
             Some(&info.serial as &[u8]),
@@ -561,12 +684,17 @@ impl StorageRaw for SqliteStorage {
     }
 }
 
+/// Information provider for the SQLite storage backend discovery.
 #[derive(Debug)]
 pub struct SqliteDBInfo {
+    /// The unique type name for this backend ("sqlite").
     db_type: &'static str,
 }
 
+/// Implementation of the `StorageDBInfo` trait for the SQLite backend.
 impl StorageDBInfo for SqliteDBInfo {
+    /// Creates a new SQLite storage instance, wrapping it in the standard
+    /// ACI layer.
     fn new(&self, conf: &Option<String>) -> Result<Box<dyn Storage>> {
         let raw_store = Box::new(SqliteStorage {
             filename: match conf {
@@ -581,9 +709,11 @@ impl StorageDBInfo for SqliteDBInfo {
         )))
     }
 
+    /// Returns the type name "sqlite".
     fn dbtype(&self) -> &str {
         self.db_type
     }
 }
 
+/// Static instance of the SQLite storage backend information provider.
 pub static DBINFO: SqliteDBInfo = SqliteDBInfo { db_type: "sqlite" };

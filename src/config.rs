@@ -1,6 +1,9 @@
 // Copyright 2024 Simo Sorce
 // See LICENSE.txt file for terms
 
+//! This module provides parsing and management functions to read the
+//! configuration file.
+
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -14,6 +17,9 @@ use serde::de;
 use serde::{Deserialize, Serialize};
 use toml;
 
+/// The directory where to search the default configuration,
+/// can be changed with the CONFDIR environment variable at
+/// build time
 #[cfg(not(test))]
 const DEFAULT_CONF_DIR: &str = {
     match option_env!("CONFDIR") {
@@ -24,6 +30,7 @@ const DEFAULT_CONF_DIR: &str = {
 #[cfg(test)]
 const DEFAULT_CONF_DIR: &str = "test";
 
+/// The default token name (token.conf)
 pub const DEFAULT_CONF_NAME: &str = "token.conf";
 
 /// Configuration for a slot
@@ -50,7 +57,7 @@ pub const DEFAULT_CONF_NAME: &str = "token.conf";
 ///
 /// \[\[slots\]\]
 ///  slot = 1
-///  dbtype = "sql"
+///  dbtype = "sqlite"
 ///  dbargs = "/var/lib/kryoptic/token.sql"
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +158,7 @@ pub struct Config {
     pub fips_behavior: FipsBehavior,
 }
 
+/// Maps some config errors to CKR_TOKEN_NOT_RECOGNIZED
 fn config_error<E: de::Error + 'static>(error: E) -> Error {
     Error::ck_rv_from_error(interface::CKR_TOKEN_NOT_RECOGNIZED, error)
 }

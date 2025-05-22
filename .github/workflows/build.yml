@@ -6,6 +6,7 @@ on:
     branches: ["main"]
   push:
     branches: ["main"]
+  workflow_dispatch:
 
 env:
   OPENSSL_BRANCH: kryoptic_ossl35

@@ -86,4 +86,6 @@ unless otherwise explicitly indicated by the contributor at the time of the
 contribution.
 
 See also the [default agreement](https://developercertificate.org/), which we assume
-for contribution, and which is currently enforced by the github DCO check.
+for contribution which is currently enforced by the github DCO check.
+
+
